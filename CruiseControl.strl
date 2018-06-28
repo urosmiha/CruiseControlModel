@@ -1,0 +1,366 @@
+
+% indicate to other modules that the cruise control is not on.
+% If on_button gets pressed the module should emit enable signal, otherwise nothing. 
+module MainControl:
+
+	input on_button;
+	input off_button;
+
+	output enable_cruise;
+		loop
+			abort
+				await immediate on_button;
+				sustain enable_cruise;
+					
+			when immediate off_button;
+			
+			pause;
+		end loop;		
+end module
+
+
+% Every time the cruise is just transitioned to on state the throttle should be managed with isGoingOn parameter as true.
+% Otherwise the throttle should be managed with isGoingOn as false.
+% If the cruise control is in Off, standby or diable state, the throttle output should match the accelerator pedal value.
+module DriveControl:
+
+	%declaration of functions in c
+	function regulateThrottle(boolean, float, float) : float;
+
+	% Interfaces
+
+	input just_on_state;
+	input cruise_on;
+	input vehicle_speed := 0.0f: float;
+	input cruise_speed := 0.0f: float;
+	input accel	:= 0.0f : float;
+	
+	output throttle_cmd: float;
+
+	every immediate tick do 
+	
+		present cruise_on then
+			present just_on_state then
+				emit throttle_cmd(regulateThrottle(true, ?cruise_speed, ?cruise_speed));
+			else
+				emit throttle_cmd(regulateThrottle(false, ?cruise_speed, ?vehicle_speed));
+			end present;
+		else
+			emit throttle_cmd(?accel);
+		end present;
+	end				
+end module
+
+
+% Simply check if current vehicle speed is above 150 km/hr
+module CheckSpeedMax:
+	input vehicle_speed : float;
+	output over_speed;
+	
+	constant upper_threshold = 150.0f : float;
+
+	every immediate tick do
+			if(?vehicle_speed > upper_threshold) then
+				emit over_speed;
+			end if;
+	end
+end module
+
+% Simply indicate if current vehicle speed is below 30 km/hr
+module CheckSpeedMin:
+	input vehicle_speed : float;
+	output under_speed;
+	
+	constant lower_threshold = 30.0f : float;
+
+	every immediate tick do
+			if(?vehicle_speed < lower_threshold) then
+				emit under_speed;
+			end if;
+	end
+	
+end module
+
+
+% Check if pedal position is above 3.0 percent.
+% and output the pure signal to indicate the breaking or accelerating.
+% Assume brake and accel cannot be praced at the same time.
+% Hence the order of checking the Accel and Brake pedal does not metter.
+module DetectPedalPress:	
+	input accel : float;
+	input brake : float;
+	output p_accel;
+	output p_brake;
+	
+	constant pedal_min = 3.0f : float;
+
+	every immediate tick do
+		if ?accel > pedal_min then
+			emit p_accel;
+		elsif ?brake > pedal_min then
+			emit p_brake;
+		end if;	
+	end
+end module
+
+% Update Cruise speed bsed on the recquest indicated by quick_accel, quick_decel and set.
+% Do not allow the cruise speed to be changed to value greater than 150 km/h or less than 30 km/hr
+% If the current vehicle speed is not in the range, and we want to set cruise speed to this speed, jsut saturate it to 30 or 150.
+% If Quick accel or deccel command is active, increase or decrease cruise speed by 2.5 respectively.
+module SpeedControl:
+	input quick_accel;
+	input quick_decel;
+	input set;
+	input on_button;
+	
+	input vehicle_speed : float;
+	input disable_speed_ctrl;
+	
+	output cruise_speed := 0.0f : float;
+	
+	constant speed_inc = 2.5f : float;
+	constant upper_threshold = 150.0f : float;
+	constant lower_threshold = 30.0f : float;
+
+	loop
+		var inc := 0.0f : float in
+		var set_speed := false : boolean in
+			suspend
+				
+				inc := 0.0f;
+				set_speed := false;
+				present(on_button or set) then 
+					set_speed := true;
+				end present;
+				
+				present quick_accel then
+					inc := speed_inc;
+				end present;
+				 	
+			 	present quick_decel then
+					inc := -speed_inc;			
+				end present;
+		
+				if (set_speed) then
+					if(?vehicle_speed > upper_threshold) then	 
+						emit cruise_speed(upper_threshold);
+					elsif(?vehicle_speed < lower_threshold) then	 
+						emit cruise_speed(lower_threshold);
+					else
+						emit cruise_speed(?vehicle_speed);
+					end if;
+				elsif(pre(?cruise_speed) + inc > upper_threshold) then
+					emit cruise_speed(upper_threshold);					
+				elsif (pre(?cruise_speed) + inc < lower_threshold) then
+					emit cruise_speed(lower_threshold)
+				else
+					emit cruise_speed(pre(?cruise_speed)+inc);
+				end if;
+
+			pause;
+			when immediate disable_speed_ctrl;
+		end var;
+		end var;
+	end loop;
+
+end module
+
+% STATE CONTROL
+% Transition to states based on the cruise speed, pedal position, resume and on button
+% Give highest priority to enble_cruise signal
+% The next highest priority signal is p_brake
+% over_speed, under_speed and p_accel are all of the same priority since they are all related (i.e. trigger the same transittion).
+% Resume is only valid if the current state is STDBY.
+% In this case priority means, the order in which we are cheching for signal presence.
+module StateControl:
+
+	input resume;
+	input p_accel;
+	input p_brake;
+	input over_speed;
+	input under_speed;
+	input enable_cruise;
+	
+	output cruise_on;
+	output just_on_state;
+	output disable_speed_ctrl;
+	output cruise_state : integer;
+	
+	var state := 1 : integer in
+		loop
+			trap FSM in
+			
+					if(state = 1) then					% OFF
+
+						present enable_cruise then
+							state := 2;
+							emit just_on_state;
+							emit cruise_on;
+							exit FSM;
+						end present;
+						
+						emit disable_speed_ctrl;		% this is emited every tick is we stay in this state
+						exit FSM;
+				
+					elsif(state = 2) then				% ON
+						
+						present (not enable_cruise) then 
+							state := 1;
+							emit disable_speed_ctrl;
+							exit FSM;
+						end present;
+							
+						present (p_accel or over_speed or under_speed) then 
+							state := 3;
+							exit FSM;
+						end present;
+						
+						present (p_brake) then  
+							state := 4;
+							exit FSM; 
+						end present;
+										
+						emit cruise_on;					% emit as long as we are in this state
+											 
+						exit FSM;		
+				
+					elsif(state = 3) then				% DISABLE
+
+						present (not enable_cruise) then 
+							state := 1;
+							emit disable_speed_ctrl;
+							exit FSM;
+						end present;
+						
+						present(p_brake) then
+							state := 4;
+							exit FSM;
+						end present;
+						
+						present (not(p_accel or over_speed or under_speed)) then 
+							state := 2;
+							emit just_on_state;
+							emit cruise_on;
+							exit FSM;
+						end present; 
+							
+						exit FSM;					
+				
+					elsif(state = 4) then			% STDBY
+						
+						present (not enable_cruise) then 
+							state := 1;
+							emit disable_speed_ctrl;
+							exit FSM;
+						end present;
+						
+						present (not(p_accel or over_speed or under_speed) and not p_brake and resume) then 
+							state := 2;
+							emit just_on_state;
+							emit cruise_on;
+							exit FSM;
+						end present; 
+						
+						present ((p_accel or over_speed or under_speed) and not p_brake and resume)  then 
+							state := 3;
+							exit FSM;
+						end present;
+						end if;
+					
+						exit FSM;		
+			
+			end trap;
+			
+			emit cruise_state(state);				% always output the state of the sysetem
+			pause;			
+		end loop;
+	end var;
+end module
+
+
+% ******* TOP LEVEL MODULE *******
+module CruiseControl:
+
+	input on_button;
+	input off_button;
+	
+	input accel := 0.0f : float;
+	input brake := 0.0f : float;
+	
+	input resume;
+	
+	input quick_accel;
+	input quick_decel;
+	input set;
+	
+	input vehicle_speed := 0.0f : float;
+	
+	output cruise_speed := 0.0f: float;
+
+	output throttle_cmd: float;
+	output cruise_state : integer;
+	
+	signal enable_cruise, over_speed, under_speed, p_accel, p_brake, disable_speed_ctrl, just_on_state, cruise_on in	
+
+		run MainControl[ signal on_button/on_button;
+			             signal off_button/off_button;
+			             signal enable_cruise/enable_cruise ]
+		||
+		run DriveControl[ signal just_on_state/just_on_state;
+				          signal vehicle_speed/vehicle_speed;
+				          signal cruise_speed/cruise_speed;
+				          signal throttle_cmd/throttle_cmd;
+				          signal accel/accel;
+				          signal cruise_on/cruise_on ] 
+		||
+		run CheckSpeedMax[ signal vehicle_speed/vehicle_speed;
+				           signal over_speed/over_speed ]
+		||
+		run CheckSpeedMin[ signal vehicle_speed/vehicle_speed;
+				           signal under_speed/under_speed ]
+		||
+		run DetectPedalPress[ signal accel/accel;
+				              signal brake/brake;
+				          	  signal p_accel/p_accel;
+				          	  signal p_brake/p_brake ]
+		||
+		run SpeedControl[ signal quick_accel/quick_accel;
+				          signal quick_decel/quick_decel;
+				          signal set/set;
+				          signal on_button/on_button;
+				          signal vehicle_speed/vehicle_speed;
+				          signal disable_speed_ctrl/disable_speed_ctrl;
+				          signal cruise_speed/cruise_speed ]
+      	||
+		run StateControl[ signal resume/resume;
+				          signal p_accel/p_accel;
+				          signal p_brake/p_brake;
+				          signal over_speed/over_speed;
+				          signal under_speed/under_speed;
+				          signal enable_cruise/enable_cruise;
+				          signal just_on_state/just_on_state;
+				          signal disable_speed_ctrl/disable_speed_ctrl;
+				          signal cruise_state/cruise_state;
+				          signal cruise_on/cruise_on ]        
+        
+    end signal;
+end module
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
